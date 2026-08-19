@@ -1,0 +1,474 @@
+// ============================================================================
+//  XArmBusLink_4.ino  —  xArm trajectory recorder / player on ESP32
+//
+//  Wiring (BusLinker V3.0, auto-direction — no external DIR pin needed):
+//    ESP32 GPIO16  → RX
+//    ESP32 GPIO17  → TX
+//    Servo bus     → half-duplex single-wire S line
+//    Servo power   → 6.0 – 7.4 V  (separate supply, NOT from USB!)
+//
+//  Button map:
+//    Toggle (keep state) : GPIO 25 (b2), 13 (b1), 19 (b0)  → menuState bits
+//    Simple pull-up      : GPIO 5  (pause/guard)
+//                          GPIO 23 (enter manual-learn mode)
+//                          GPIO 18 (exit manual-learn mode — pressed=LOW)
+//                          GPIO 26 (capture point / erase-TRJ trigger)
+//
+//  menuState encoding  (25<<2 | 13<<1 | 19):
+//    0b011 = 3  → Record trajectory (pot mode; manual-learn on GPIO23)
+//    0b101 = 5  → Save trajectory to flash
+//    0b110 = 6  → Load from flash and loop-play
+//    0b111 = 7  → Go neutral (500) + relax torque
+//    0b111 + !GPIO26 = 7 + erase  → Overwrite flash with all-500 trajectory
+//
+//  Module layout:
+//    XArmKinematics.h/.cpp  — pure planar FK/IK math (no hardware deps)
+//    ArmMotion.h/.cpp       — servo bus + kinematics-driven motion helpers
+//    TrajectoryStore.h/.cpp — trajectory buffer, FK bookkeeping, flash I/O
+//    (this file)            — pin/button config, mode state machine only
+// ============================================================================
+
+
+/*
+
+Notes regarding the code: 
+- it fails to reach any X<0 position
+- it should be able to reach all 4 quadrants including the Q3 and Q4 as underground.
+- the ik results aren;t consistent
+what we need:
+ - consistent inverse position kinematics in all quadrants based on Servo mechanical limitation.  
+ - use the global / local  coordinate system  conversion and 
+ probably you want to use radians for thi operation in the range 0-2pi
+ - when multiple solutions are available use the one whic can be achieved by the sevos
+ - the "One solid " horizontal" position  should be aligned with the quadrant ahead of th arm tip
+ - when "one solid" reaches minin or  max value do not deny the position keep the angle at the limit reached 
+
+
+*/
+#include <bitset>
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <string>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include "LX15D.h"
+#include "SensorHandler.h"
+#include "aux_.h"
+#include <Preferences.h>
+#include "XArmKinematics.h"
+#include "ArmMotion.h"
+#include "TrajectoryStore.h"
+
+// ── pin assignments ──────────────────────────────────────────────────────────
+#define RX_PIN 16
+#define TX_PIN 17
+#define DIR_PIN 4  // not used — BusLinker handles direction internally
+
+// ── program variables (sensor scan / mode state — stay in the .ino) ────────
+uint8_t found[16];
+uint8_t n;
+Sensor* s;
+uint16_t menuState = 0b1111;
+float serX = 00.00, serY = 254.00;
+std::vector<uint16_t> mslc = { 25, 13, 19 };  // menu selection pins
+/********************************************************************************************/
+
+
+/********************************************************************************************/
+void ReadMenu(const char* Fork = "*", bool P = true, uint16_t D = 50) {
+  static uint16_t menuState0 = 0b111;
+  readAnalogs();
+  menuState = (iS[25] << 2) | (iS[13] << 1) | iS[19];
+  if (menuState != menuState0) {
+    if (P) { std::cout << Fork << std::bitset<3>(menuState) << "\n"; }
+    menuState0 = menuState;
+    delay(D);
+  }
+}
+/********************************************************************************************/
+void readSerXY() {
+  // Check if there is data available to read from the Serial Monitor
+  if (Serial.available() > 0) {
+    // Read the incoming string until a newline character '\n' is encountered
+    String incomingMessage = Serial.readStringUntil('\n');
+    // Trim any accidental trailing carriage returns (\r) or whitespace
+    incomingMessage.trim();
+    // Only process if the message isn't empty
+    if (incomingMessage.length() > 0) {
+      // Print back the received message
+
+      // transfer  to float  - detect comas
+      int commaIndex = incomingMessage.indexOf('*');
+
+      if (commaIndex != -1) {
+        // Extract the substring before the comma
+        String firstPart = incomingMessage.substring(0, commaIndex);
+        // Extract the substring after the comma
+        String secondPart = incomingMessage.substring(commaIndex + 1);
+
+        // Trim away any accidental leading/trailing spaces
+        firstPart.trim();
+        secondPart.trim();
+
+        // Convert the cleaned substrings into actual float variables
+        serX = firstPart.toFloat();
+        serY = secondPart.toFloat();
+        // Print the results to verify the allocation worked perfectly
+        Serial.println("Parsing Successful!");
+        Serial.print(serX, 3);
+        Serial.print("  ");
+        Serial.println(serY, 3);
+      } else if (int commaIndex = incomingMessage.indexOf('S') || incomingMessage.indexOf('s')) {
+        captureTrajectoryPoint();
+      } else {
+        Serial.println("[readSerXY] NO COMMA FOUND — serX/serY unchanged");
+      }
+    }
+  }
+}
+
+// ============================================================================
+//  setup()
+// ============================================================================
+void setup() {
+  initSensors();
+  Serial.begin(115200);
+  while (!Serial) { ; }
+
+  Serial.println("ESP32 Servo Controller Initialized.");
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout detector
+  generateDeviceKey();
+  Serial.println(deviceKey.c_str());
+  Serial.println("**********************************************");
+  Serial.println(getBuildInfo().c_str());
+  Serial.println("**********************************************");
+
+
+  bus.begin(115200, RX_PIN, TX_PIN);
+  // Pause ADC before Flash access (prevents Cache Panic)
+  analogContinuousStop();
+  pct = loadTrajectory(TRJ, maxPct);
+  Serial.println("Trajectory loaded pct: " + String(pct));
+  analogContinuousStart();
+
+  if (pct <= 0) {
+    // No stored trajectory — fill with neutral 500
+    for (int i = 0; i < maxPct; i++) {
+      for (int j = 0; j < 6; j++) TRJ[i].angle[j] = 500;
+    }
+    pct = maxPct;
+  } else {
+    Serial.println("Loaded trajectory points: " + String(pct));
+  }
+
+  delay(500);
+
+  Serial.println("LX15D library for ESP32 by Claude");
+  // Scan for servos IDs 1-10
+  n = bus.scan(found, 16, 1, 10);
+  Serial.printf("Found %d servo(s): ", n);
+  for (uint8_t i = 0; i < n; i++) Serial.printf("%d ", found[i]);
+  Serial.println();
+
+  for (int i = 0; i < 6; i++) {
+    bus.setPositionMode(i + 1);
+  }
+
+
+  // Print full status
+  for (int i = 0; i < 6; i++) {
+    if (bus.getStatus(i + 1, st)) {
+      Serial.printf("Servo %d: %.2f V  %d°C  pos=%d  mode=%d\n",
+                    st.id, st.voltage, st.temperature,
+                    st.position, st.mode);
+    }
+  }
+
+  // Move all servos to neutral 500
+  for (int i = 0; i < 6; i++) grp[i] = (LX15DMove){ i + 1, 500 };
+  bus.moveSync(grp, 6, 2000);
+  /*****************************************************************************************************/
+
+  ReadMenu();
+  //  if (iS[5]) { ; }
+  //kin.fk(u3, u4, u5, out);
+}
+
+// ============================================================================
+//  loop()
+// ============================================================================
+void loop() {
+  // GPIO5 pull-up: LOW (iS[5]==0) = pressed = run; HIGH = pause
+  //std::cout << "MenuState " << std::bitset<3>(menuState) << "\n";
+  ReadMenu( "Start point ");
+  //1-------------------------------------------
+  if (!iS[5]) {
+    ReadMenu( " 18&26&5 \n press/relase 5 to continue  ", true, 2000);
+    if ((!iS[18]) && (!iS[26])) { ESP.restart(); }  // reset if needed !iS[5]
+  }
+
+  //2-------------------------------------------
+  if ((!iS[5]) && (menuState == 0b001)) {
+    Serial.print("Manual coords XY ");
+    ReadMenu( "Release 5 ", true, 2000);
+
+    while (iS[5]) {
+      readSerXY();
+      movXY(serX, serY);
+      ReadMenu( "Release 5 ");
+    }
+    ReadMenu("Release 5 ", true, 2000);
+  }
+  ReadMenu();
+  //3-------------------------------------------
+  // ── Record TRJ (menuState = 011) ─────────────────────────────────────────
+  if ((!iS[5]) && (menuState == 0b011)) {
+    Serial.println("Recording Trajectory TRJ ----");
+    delay(500);
+    recTRJ();
+    Serial.println("  Out of TRJ Recording");
+  }
+  ReadMenu();
+  //4-------------------------------------------
+  // ── Save TRJ to flash (menuState = 101) ──────────────────────────────────
+  if ((!iS[5]) && (menuState == 0b101) && (pct > 0)) {
+    Serial.println("Saving TRJ to flash ----");
+    analogContinuousStop();
+    saveTrajectory(TRJ, pct);
+    analogContinuousStart();
+    Serial.println("TRJ saved ----");
+    delay(1000);
+  }
+  ReadMenu();
+  //5-------------------------------------------
+  // ── Load from flash + loop-play (menuState = 110) ────────────────────────
+  if ((!iS[5]) && (menuState == 0b110)) {
+    Serial.println("Loading TRJ from flash ....");
+    analogContinuousStop();
+    pct = loadTrajectory(TRJ, maxPct);
+    analogContinuousStart();
+    delay(1000);
+    Serial.println("TRJ loaded from flash.");
+
+    // Loop-play while toggle state stays at 110
+    while (menuState == 0b110) {
+      Serial.println(" Repeating TRJ from flash..");
+
+      for (int i = 0; i < pct; i++) {
+        for (int j = 0; j < 6; j++) {
+          grp[j] = (LX15DMove){ j + 1, TRJ[i].angle[j] };
+        }
+        Serial.print(i);
+        CalculateTrajectoryPoint();
+        movSpeedSync(grp, 6, 25);
+        //bus.moveSync(grp, 6, 2500);
+      }
+      ReadMenu();
+    }
+  }
+  ReadMenu();
+  //6-------------------------------------------
+  // ── Neutral + relax (menuState = 111, GPIO26 not pressed) ────────────────
+  if ((!iS[5]) && (menuState == 0b111)) {
+    if (iS[26]) {
+      // GPIO26 HIGH = not pressed → go neutral and relax torque
+      Serial.println(" Getting in neutral and relax..");
+      for (int i = 0; i < 6; i++) grp[i] = (LX15DMove){ i + 1, 500 };
+      bus.moveSync(grp, 6, 2500);
+      for (int i = 0; i < 6; i++) bus.setTorque(i + 1, 0);
+    } else {
+      // GPIO26 LOW = pressed → erase TRJ and write all-500 to flash
+      Serial.println("TRJ erase: overwriting with neutral 500 series");
+      for (int i = 0; i < maxPct; i++) {
+        TRJ[i].angle[0] = 600;  // keep original offset on joint 0
+        for (int j = 1; j < 6; j++) TRJ[i].angle[j] = 500;
+      }
+      analogContinuousStop();
+      saveTrajectory(TRJ, maxPct);
+      analogContinuousStart();
+      Serial.println("TRJ overwrite done ----");
+      pct = 0;
+      delay(1000);
+    }
+  }
+
+  ReadMenu();
+  //6-------------------------------------------
+  if (!iS[5] && menuState == 0b010) {
+    // Hand-edited (x,y) list in TrajectoryPoints.h always overwrites whatever
+    // was just loaded from flash — see TrajectoryStore.cpp / TrajectoryPoints.h.
+    // No trigger/menuState needed: this runs unconditionally at boot.
+    // Saving the result back to flash stays a manual step (menuState 0b101).
+    pct = loadTrajectoryFromXY();
+    for (int i = 0; i < pct; i++) {
+      for (int j = 0; j < 6; j++) {
+        grp[j] = (LX15DMove){ j + 1, TRJ[i].angle[j] };
+      }
+      Serial.print(i);
+      CalculateTrajectoryPoint();
+      movSpeedSync(grp, 6, 25);
+      //bus.moveSync(grp, 6, 2500);
+    }
+  }
+}
+
+// ============================================================================
+//  recTRJ()  —  trajectory recording (called when menuState == 0b011)
+//
+//  GPIO23 LOW (pressed) → enter manual-learn mode (torque off, move by hand)
+//    GPIO18 LOW (pressed) → exit manual-learn mode
+//    GPIO27 LOW (pressed) → capture point in manual-learn mode
+//  GPIO23 HIGH (not pressed) → pot-control mode
+//    GPIO27 HIGH → pot-control jog loop runs
+//    GPIO27 LOW (pressed) → exit jog loop and capture point
+// ============================================================================
+void recTRJ() {
+  const int sns = 5;  // pot sensitivity dead-band
+
+  Serial.println(pct);
+  if (pct >= 100) pct = 0;
+  Serial.println(pct);
+
+  readAnalogs();
+  menuState = (iS[25] << 2) | (iS[13] << 1) | iS[19];
+
+  while (menuState == 0b011) {
+    readAnalogs();
+    menuState = (iS[25] << 2) | (iS[13] << 1) | iS[19];
+
+    // ── Manual-learn mode: GPIO23 pressed (LOW) ──────────────────────────
+    if (!iS[23]) {
+      // Release torque so the arm can be moved by hand
+      for (int i = 0; i < 6; i++) bus.setTorque(i + 1, 0);
+      Serial.println("Manual programming - release 23");
+      delay(5000);
+
+      // Stay in manual mode until GPIO18 is pressed (LOW)
+      while (iS[18]) {  // iS[18]==1 = not yet pressed (pull-up)
+        readAnalogs();
+        CalculateTrajectoryPoint();
+        // GPIO27 pressed (LOW) → capture this position as a TRJ point
+        if (!iS[27]) {
+          // for (int i = 0; i < 6; i++) {
+          //   TRJ[pct].angle[i] = safeReadPos(i + 1);
+          // }
+          captureTrajectoryPoint();
+        }
+      }
+      return;  // exit recTRJ after manual session
+    }
+
+    // ── Pot-control mode ─────────────────────────────────────────────────
+    int Clamp = map(iS[36], 0, 4095, 150, 650);
+    int Rotate = map(iS[39], 0, 4095, 0, 1000);
+    int Stick = map(iS[32], 0, 4095, U4_MIN, U4_MAX);
+    int Tilt = map(4095 - iS[33], 0, 4095, U3_MIN, U3_MAX);
+    int Boom = map(iS[34], 0, 4095, U5_MIN, U5_MAX);
+    int Swing = map(iS[35], 0, 4095, 50, 950);
+
+    int Clamp0 = Clamp;
+    int Rotate0 = Rotate;
+    int Stick0 = Stick;
+    int Tilt0 = Tilt;
+    int Boom0 = Boom;
+    int Swing0 = Swing;
+
+    // Engage torque for pot control
+    for (int i = 0; i < 6; i++) bus.setTorque(i + 1, 1);
+
+    // Pot-control loop — runs while GPIO27 is HIGH (not pressed)
+    // Press GPIO27 to exit loop and capture the current position
+    while (iS[27]) {
+      readAnalogs();
+      menuState = (iS[25] << 2) | (iS[13] << 1) | iS[19];
+
+      // Clamp (servo 1) ── range 150-750
+      const int ClampMin = 150, ClampMax = 750;
+      Clamp = map(iS[36], 0, 4095, ClampMin, ClampMax);
+      if ((abs(Clamp - Clamp0) > sns) && (Clamp >= ClampMin) && (Clamp <= ClampMax)) {
+        Clamp0 = Clamp;
+        grp[0] = (LX15DMove){ 1, Clamp };
+        //bus.move(1, Clamp, 50);
+        movSpeedSync(grp, 6, 100);
+      } else {
+        Clamp = Clamp0;
+      }
+
+      // Rotate (servo 2) ── range 0-1000
+      const int RotateMin = 250, RotateMax = 950;
+      Rotate = map(iS[39], 0, 4095, RotateMin, RotateMax);
+      if ((abs(Rotate - Rotate0) > sns) && (Rotate >= RotateMin) && (Rotate <= RotateMax)) {
+        Rotate0 = Rotate;
+        grp[1] = (LX15DMove){ 2, Rotate };
+        //bus.move(2, Rotate, 50);
+        movSpeedSync(grp, 6, 100);
+      } else {
+        Rotate = Rotate0;
+      }
+
+      // Stick (servo 3) ── range 0-1000
+      const int StickMin = U4_MIN, StickMax = U4_MAX;
+      Stick = map(iS[32], 0, 4095, StickMin, StickMax);
+      if ((abs(Stick - Stick0) > sns) && (Stick >= StickMin) && (Stick <= StickMax)) {
+        Stick0 = Stick;
+        grp[2] = (LX15DMove){ 3, Stick };
+        //bus.move(3, Stick, 250);
+        movSpeedSync(grp, 6, 25);
+      } else {
+        Stick = Stick0;
+      }
+
+      // Tilt (servo 4) ── range 0-1000 (pot inverted)
+      const int TiltMin = U3_MIN, TiltMax = U3_MAX;
+      Tilt = map(4095 - iS[33], 0, 4095, TiltMin, TiltMax);
+      if ((abs(Tilt - Tilt0) > sns) && (Tilt >= TiltMin) && (Tilt <= TiltMax)) {
+        Tilt0 = Tilt;
+        grp[3] = (LX15DMove){ 4, Tilt };
+        //bus.move(4, Tilt, 100);
+        movSpeedSync(grp, 6, 25);
+      } else {
+        Tilt = Tilt0;
+      }
+
+      // Boom (servo 5) ── range 300-700
+      const int BoomMin = U5_MIN, BoomMax = U5_MAX;
+      Boom = map(iS[34], 0, 4095, BoomMin, BoomMax);
+      if ((abs(Boom - Boom0) > sns) && (Boom >= BoomMin) && (Boom <= BoomMax)) {
+        Boom0 = Boom;
+        grp[4] = (LX15DMove){ 5, Boom };
+        //bus.move(5, Boom, 250);
+        movSpeedSync(grp, 6, 25);
+      } else {
+        Boom = Boom0;
+      }
+
+      // Swing (servo 6) ── range 50-950
+      const int SwingMin = 50, SwingMax = 950;
+      Swing = map(iS[35], 0, 4095, SwingMin, SwingMax);
+      if ((abs(Swing - Swing0) > sns) && (Swing >= SwingMin) && (Swing <= SwingMax)) {
+        Swing0 = Swing;
+        grp[5] = (LX15DMove){ 6, Swing };
+        //bus.move(6, Swing, 50);
+        movSpeedSync(grp, 6, 50);
+      } else {
+        Swing = Swing0;
+      }
+    }
+
+    captureTrajectoryPoint();
+  }
+}
+/**
+*
+*
+*
+*
+*
+*
+*
+*
+*
+*
+*/
