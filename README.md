@@ -1,5 +1,7 @@
 # XArmBusLink-using-ESP32
 Repository for driving the LewanSoul Xarm robotic arm developped with Claude IA
+
+
 // ============================================================================
 //  XArmBusLink_7_K_15.ino  —  xArm trajectory recorder / player on ESP32
 //
