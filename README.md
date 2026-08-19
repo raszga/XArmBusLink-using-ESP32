@@ -6,7 +6,7 @@ ESP32 firmware for controlling a LewanSoul/Hiwonder LX-15D bus-servo 6-DOF robot
 
 ## Overview
 
-XArmBusLink drives a 6-servo arm using inverse kinematics for XY/TCP-frame targeting, synchronized speed-based moves, and flash-persisted trajectories.
+XArmBusLink drives a 6-servo arm using inverse kinematics for XY/TCP-frame targeting, synchronized speed-based moves, and flash-persisted trajectories...
 
 ## Hardware
 
